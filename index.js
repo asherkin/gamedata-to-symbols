@@ -1,9 +1,13 @@
 // vim: set background=light:
 
 const fs = require('fs');
+const path = require('path');
 const util = require('util');
-const vdf = require('@node-steam/vdf');
 const r2promise = require('r2pipe-promise');
+
+const smc = require('./smc-parser');
+
+const exec = util.promisify(require('child_process').exec);
 
 /*
 const gameDataFile = './game.csgo.txt';
@@ -17,41 +21,86 @@ const binaryFile = './server.dll';
 
 (async function() {
     const gameDataText = await util.promisify(fs.readFile)(gameDataFile, 'utf8');
-    const gameDataNoComments = gameDataText.replace(/(\/\*(?:(?!\*\/).|[\n\r])*\*\/)/, '');
-    const gameData = vdf.parse(gameDataNoComments);
-    // console.log(JSON.stringify(gameData, null, 2));
+    const gameData = smc.parse(gameDataText);
+    //console.log(JSON.stringify(gameData, null, 2));
 
     const functions = {};
 
-    for (const section in gameData['Games']) {
-        if (!gameData['Games'].hasOwnProperty(section)) {
+    for (let rootIndex = 0; rootIndex < gameData.length; ++rootIndex) {
+        const root = gameData[rootIndex];
+
+        if (root.key != 'Games') {
             continue;
         }
 
-        if (!gameData['Games'][section].hasOwnProperty('Signatures')) {
-            continue;
-        }
+        const sections = root.value;
 
-        for (const func in gameData['Games'][section]['Signatures']) {
-            if (!gameData['Games'][section]['Signatures'].hasOwnProperty(func)) {
-                continue;
+        for (let sectionIndex = 0; sectionIndex < sections.length; ++sectionIndex) {
+            const section = sections[sectionIndex];
+
+            // TODO: Check section.key for supported games.
+
+            const blocks = section.value;
+
+            let skipSection = false;
+            const innerFunctions = {};
+
+            for (let blockIndex = 0; blockIndex < blocks.length; ++blockIndex) {
+                const block = blocks[blockIndex];
+
+                if (block.key === '#supported') {
+                    // TODO: Check supported games.
+                } else if (block.key === 'Signatures') {
+                    const signatures = block.value;
+
+                    for (let signatureIndex = 0; signatureIndex < signatures.length; ++signatureIndex) {
+                        const signature = signatures[signatureIndex];
+
+                        const platforms = signature.value;
+
+                        for (let platformIndex = 0; platformIndex < platforms.length; ++platformIndex) {
+                            const platform = platforms[platformIndex];
+
+                            if (platform.key !== gameDataPlatform) {
+                                continue;
+                            }
+
+                            const key = path.basename(gameDataFile, '.txt') + '::' + signature.key;
+                            const radareSignature = platform.value.replace(/\\x2A/gi, '..').replace(/\\x([0-9A-F]{2})/gi, '$1');
+                            innerFunctions[key] = radareSignature;
+                        }
+                    }
+                }
             }
 
-            if (!gameData['Games'][section]['Signatures'][func].hasOwnProperty(gameDataPlatform)) {
-                continue;
-            }
+            if (!skipSection) {
+                for (const func in innerFunctions) {
+                    if (!innerFunctions.hasOwnProperty(func)) {
+                        continue;
+                    }
 
-            const signature = gameData['Games'][section]['Signatures'][func][gameDataPlatform];
-            const radareSignature = signature.replace(/2A/g, '..').replace(/\\x/g, '');
-            functions[func] = radareSignature;
+                    functions[func] = innerFunctions[func];
+                }
+            }
         }
     }
 
-    console.log(JSON.stringify(functions, null, 2));
+    // console.log(JSON.stringify(functions, null, 2));
+
+    const output = [];
+
+    if (binaryFile.match(/\.so$/i)) {
+        const identifier = (await exec('../bin/breakpad_moduleid ' + binaryFile)).stdout.trim();
+        output.push(util.format('MODULE Linux x86 %s %s', identifier, path.basename(binaryFile)));
+    } else if (binaryFile.match(/\.dll$/i)) {
+        const debugInfo = (await exec('objdump -p ' + binaryFile + ' | grep -A1 CodeView | tail -n 1')).stdout.trim().match(/\(format [^ ]+ signature ([^ ]+) age ([^ ]+)\)/);
+        const identifier = debugInfo[1].toUpperCase() + (+debugInfo[2]).toString(16).toLowerCase();
+        output.push(util.format('MODULE windows x86 %s %s', identifier, path.basename(binaryFile).replace(/\.dll$/i, '.pdb')));
+    }
 
     const r2 = await r2promise.open(binaryFile);
 
-    const output = [];
+    const binaryInfo  = await r2.cmdj('iIj');
 
     for (const func in functions) {
         if (!functions.hasOwnProperty(func)) {
@@ -62,10 +111,10 @@ const binaryFile = './server.dll';
         // console.log(search);
 
         if (search.length === 0) {
-            console.log('no match found for ' + func);
+            // console.log('no match found for ' + func);
             continue;
         } else if (search.length > 1) {
-            console.log(search.length + ' matches found for ' + func);
+            // console.log(search.length + ' matches found for ' + func);
         }
 
         const analyze = await r2.cmd('af ' + func + ' ' + search[0].offset);
@@ -93,10 +142,11 @@ const binaryFile = './server.dll';
             paramSize += 4;
         }
 
-        output.push(util.format('FUNC %s %s %s %s', info.offset.toString(16), info.size.toString(16), paramSize.toString(16), func));
+        output.push(util.format('FUNC %s %s %s %s', (info.offset - binaryInfo.baddr).toString(16), info.size.toString(16), paramSize.toString(16), func));
     }    
 
-    console.log(JSON.stringify(output, null, 2));
+    // console.log(JSON.stringify(output, null, 2));
+    console.log(output.join('\n'));
 
     r2.quit();
 })();
