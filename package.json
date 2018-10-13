@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@node-steam/vdf": "^2.0.1",
+    "r2pipe": "^2.6.3",
+    "r2pipe-promise": "^1.4.1"
+  }
+}
