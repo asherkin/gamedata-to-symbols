@@ -1,0 +1,14 @@
+{
+    "tf2": {
+        "engine": ["orangebox_valve", "tf2"],
+        "directory": "tf",
+        "name": "Team Fortress 2",
+        "description": "Team Fortress 2"
+    },
+    "csgo": {
+        "engine": "csgo",
+        "directory": "csgo",
+        "name": "Counter-Strike: Global Offensive",
+        "description": "Counter-Strike: Global Offensive"
+    }
+}

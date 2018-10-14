@@ -1,152 +1,213 @@
-// vim: set background=light:
+process.on("uncaughtException", (err) => {
+    // process.stderr.write("Error: " + err.message + "\n");
+    process.stderr.write(err.stack + "\n");
+    process.exit(1);
+});
 
-const fs = require('fs');
-const path = require('path');
-const util = require('util');
-const r2promise = require('r2pipe-promise');
+process.on("unhandledRejection", (err) => {
+    throw err;
+});
 
-const smc = require('./smc-parser');
+const path = require("path");
+const util = require("util");
+const r2promise = require("r2pipe-promise");
 
-const exec = util.promisify(require('child_process').exec);
+const gameInfo = require("./gameinfo");
 
-/*
-const gameDataFile = './game.csgo.txt';
-const gameDataPlatform = 'linux';
-const binaryFile = './server.so';
-*/
+const childProcessExec = util.promisify(require("child_process").exec);
 
-const gameDataFile = './game.csgo.txt';
-const gameDataPlatform = 'windows';
-const binaryFile = './server.dll';
+function translateSignature(signature) {
+    return signature.match(/\\x[a-f0-9]{2}|./ig)
+        .map((c) => (c.length === 4) ? Number.parseInt(c.slice(2), 16) : c.charCodeAt(0))
+        .map((o) => (o === 42) ? ".." : ("00" + o.toString(16)).substr(-2))
+        .join("");
+}
 
-(async function() {
-    const gameDataText = await util.promisify(fs.readFile)(gameDataFile, 'utf8');
-    const gameData = smc.parse(gameDataText);
-    //console.log(JSON.stringify(gameData, null, 2));
+async function getDllDebugIdentifier(file) {
+    // TODO: Make this safe.
+    const cmd = await childProcessExec("objdump -p " + file + " | grep -A1 CodeView | tail -n 1");
+    const debugInfo = cmd.stdout.trim().match(/^\(format [^ ]+ signature ([^ ]+) age ([^ ]+)\)$/);
+    return debugInfo[1].toUpperCase() + (+debugInfo[2]).toString(16).toLowerCase();
+}
 
-    const functions = {};
+async function getSoDebugIdentifier(file) {
+    // TODO: Make this safe.
+    const cmd = await childProcessExec("objdump -s -j .note.gnu.build-id " + file + " | grep -A2 'Contents of section' | tail -n 1");
+    const debugInfo = cmd.stdout.trim().match(/^[0-9a-f]+ +([0-9a-f]{8}) ([0-9a-f]{8}) ([0-9a-f]{8}) ([0-9a-f]{8}) /);
+    debugInfo[1] = debugInfo[1].match(/../g).reverse().join("");
+    debugInfo[2] = debugInfo[2].match(/..../g).map((c) => c.match(/../g).reverse().join("")).join("");
+    return (debugInfo[1] + debugInfo[2] + debugInfo[3] + debugInfo[4] + "0").toUpperCase();
+}
 
-    for (let rootIndex = 0; rootIndex < gameData.length; ++rootIndex) {
-        const root = gameData[rootIndex];
+function printSupportedGames() {
+    process.stderr.write("Supported games:");
+    for (const game of Object.keys(gameInfo)) {
+        process.stderr.write(" " + game);
+    }
+    process.stderr.write("\n");
+}
 
-        if (root.key != 'Games') {
-            continue;
-        }
+async function processFunction(r2, baseAddr, offset, name) {
+    await r2.cmd("af " + offset + " " + offset);
+    const info = (await r2.cmdj("afij " + offset))[0];
 
-        const sections = root.value;
-
-        for (let sectionIndex = 0; sectionIndex < sections.length; ++sectionIndex) {
-            const section = sections[sectionIndex];
-
-            // TODO: Check section.key for supported games.
-
-            const blocks = section.value;
-
-            let skipSection = false;
-            const innerFunctions = {};
-
-            for (let blockIndex = 0; blockIndex < blocks.length; ++blockIndex) {
-                const block = blocks[blockIndex];
-
-                if (block.key === '#supported') {
-                    // TODO: Check supported games.
-                } else if (block.key === 'Signatures') {
-                    const signatures = block.value;
-
-                    for (let signatureIndex = 0; signatureIndex < signatures.length; ++signatureIndex) {
-                        const signature = signatures[signatureIndex];
-
-                        const platforms = signature.value;
-
-                        for (let platformIndex = 0; platformIndex < platforms.length; ++platformIndex) {
-                            const platform = platforms[platformIndex];
-
-                            if (platform.key !== gameDataPlatform) {
-                                continue;
-                            }
-
-                            const key = path.basename(gameDataFile, '.txt') + '::' + signature.key;
-                            const radareSignature = platform.value.replace(/\\x2A/gi, '..').replace(/\\x([0-9A-F]{2})/gi, '$1');
-                            innerFunctions[key] = radareSignature;
-                        }
-                    }
-                }
-            }
-
-            if (!skipSection) {
-                for (const func in innerFunctions) {
-                    if (!innerFunctions.hasOwnProperty(func)) {
-                        continue;
-                    }
-
-                    functions[func] = innerFunctions[func];
-                }
-            }
-        }
+    if (!info) {
+        return false;
     }
 
-    // console.log(JSON.stringify(functions, null, 2));
+    let paramSize = 0;
+    for (const bpvar of info.bpvars) {
+        if (bpvar.kind !== "arg") {
+            continue;
+        }
+        if (bpvar.type !== "int") {
+            throw new Error("unknown bpvar arg type " + bpvar.type);
+        }
+        paramSize += 4;
+    }
+    for (const spvar of info.spvars) {
+        if (spvar.kind !== "arg") {
+            continue;
+        }
+        if (spvar.type !== "int") {
+            throw new Error("unknown spvar arg type " + spvar.type);
+        }
+        paramSize += 4;
+    }
+
+    if (info.size < info.realsz) {
+        process.stderr.write("Warning: size < realsz for " + name + ", possibly midfunc\n");
+    }
+
+    if ((info.offset & 0xF) !== 0) {
+        process.stderr.write("Warning: Address not aligned to 16-bytes for " + name + ", possibly midfunc\n");
+    }
+
+    return {
+        offset: info.offset - baseAddr,
+        size: info.size,
+        paramSize: paramSize,
+        name: name,
+    };
+}
+
+const args = process.argv.slice(2);
+if (args.length !== 3) {
+    process.stderr.write("Usage: <binary path> <game> <gamedata path>\n");
+    printSupportedGames();
+    process.exit(1);
+}
+
+if (!gameInfo[args[1]]) {
+    process.stderr.write("Error: " + args[1] + " is not a supported game\n");
+    printSupportedGames();
+    process.exit(1);
+}
+
+(async function() {
+    const r2 = await r2promise.open(args[0]);
+    const binaryInfo = await r2.cmdj("iIj");
+
+    let platform = binaryInfo.os;
+    if (binaryInfo.bits !== 32) {
+        platform += binaryInfo.bits;
+    }
+
+    const gamedataParser = require("./gamedata-parser")(platform, gameInfo[args[1]]);
+    const gamedata = await gamedataParser.loadAll(args[2]);
 
     const output = [];
 
-    if (binaryFile.match(/\.so$/i)) {
-        const identifier = (await exec('../bin/breakpad_moduleid ' + binaryFile)).stdout.trim();
-        output.push(util.format('MODULE Linux x86 %s %s', identifier, path.basename(binaryFile)));
-    } else if (binaryFile.match(/\.dll$/i)) {
-        const debugInfo = (await exec('objdump -p ' + binaryFile + ' | grep -A1 CodeView | tail -n 1')).stdout.trim().match(/\(format [^ ]+ signature ([^ ]+) age ([^ ]+)\)/);
-        const identifier = debugInfo[1].toUpperCase() + (+debugInfo[2]).toString(16).toLowerCase();
-        output.push(util.format('MODULE windows x86 %s %s', identifier, path.basename(binaryFile).replace(/\.dll$/i, '.pdb')));
+    for (const file of gamedata) {
+        for (const key in file.signatures) {
+            const name = file.name + "::" + key;
+            const signature = translateSignature(file.signatures[key]);
+
+            const search = await r2.cmdj("/xj " + signature);
+            if (search.length === 0) {
+                process.stderr.write("Warning: Failed to find match for " + name + "\n");
+                continue;
+            } else if (search.length > 1) {
+                process.stderr.write("Warning: Multiple matches found for " + name + "\n");
+            }
+
+            const result = search[0];
+            const func = await processFunction(r2, binaryInfo.baddr, result.offset, name);
+            if (!func) {
+                continue;
+            }
+
+            output.push(func);
+        }
     }
 
-    const r2 = await r2promise.open(binaryFile);
+    const exports = await r2.cmdj("iEj");
 
-    const binaryInfo  = await r2.cmdj('iIj');
-
-    for (const func in functions) {
-        if (!functions.hasOwnProperty(func)) {
+    for (const exprt of exports) {
+        if (exprt.type !== "FUNC") {
             continue;
         }
 
-        const search = await r2.cmdj('/xj ' + functions[func]);
-        // console.log(search);
+        let name = exprt.name;
+        if (binaryInfo.bintype === "pe") {
+            name = name.match(/_(.*)$/)[1];
+            let demangledName = (await r2.cmd("\"iD msvc " + name + "\"")).trim();
+            demangledName = demangledName.match(/^[^:]+: [^ ]+ [^ ]+ (.+)$/);
+            if (demangledName) {
+                name = demangledName[1];
+            }
+        }
 
-        if (search.length === 0) {
-            // console.log('no match found for ' + func);
+        const func = await processFunction(r2, binaryInfo.baddr, exprt.vaddr, name);
+        if (!func) {
             continue;
-        } else if (search.length > 1) {
-            // console.log(search.length + ' matches found for ' + func);
         }
 
-        const analyze = await r2.cmd('af ' + func + ' ' + search[0].offset);
-
-        const info = (await r2.cmdj('afij ' + search[0].offset))[0];
-        // console.log(info);
-
-        let paramSize = 0;
-        for (let i = 0; i < info.bpvars.length; ++i) {
-            if (info.bpvars[i].kind !== 'arg') {
-                continue;
-            }
-            if (info.bpvars[i].type !== 'int') {
-                throw new Error('unknown bpvar arg type');
-            }
-            paramSize += 4;
-        }
-        for (let i = 0; i < info.spvars.length; ++i) {
-            if (info.spvars[i].kind !== 'arg') {
-                continue;
-            }
-            if (info.spvars[i].type !== 'int') {
-                throw new Error('unknown spvar arg type');
-            }
-            paramSize += 4;
-        }
-
-        output.push(util.format('FUNC %s %s %s %s', (info.offset - binaryInfo.baddr).toString(16), info.size.toString(16), paramSize.toString(16), func));
-    }    
-
-    // console.log(JSON.stringify(output, null, 2));
-    console.log(output.join('\n'));
+        output.push(func);
+    }
 
     r2.quit();
+
+    let headerPlatform = "unknown";
+    let headerArch = "unknown";
+    let headerDebugIdentifier = null;
+    let headerDebugName = path.basename(args[0]);
+
+    if (binaryInfo.os === "linux") {
+        headerPlatform = "Linux";
+        headerDebugIdentifier = await getSoDebugIdentifier(args[0]);
+    } else if (binaryInfo.os === "windows") {
+        headerPlatform = "windows";
+        // headerDebugIdentifier = binaryInfo.guid; // https://github.com/radare/radare2/pull/11805
+        headerDebugIdentifier = await getDllDebugIdentifier(args[0]);
+        headerDebugName = path.basename(binaryInfo.dbg_file);
+    }
+
+    if (binaryInfo.arch === "x86" && binaryInfo.bits === 32) {
+        headerArch = "x86";
+    } else if (binaryInfo.arch === "x86" && binaryInfo.bits === 64) {
+        headerArch = "x86_64";
+    }
+
+    process.stdout.write([
+        "MODULE",
+        headerPlatform,
+        headerArch,
+        headerDebugIdentifier,
+        headerDebugName,
+        "\n",
+    ].join(" "));
+
+    output.sort((a, b) => a.offset - b.offset);
+
+    for (const func of output) {
+        process.stdout.write([
+            "FUNC",
+            func.offset.toString(16),
+            func.size.toString(16),
+            func.paramSize.toString(16),
+            func.name,
+            "\n",
+        ].join(" "));
+    }
 })();
