@@ -180,6 +180,8 @@ if (args.length > 1 && !gameInfo[args[1]]) {
         output.push(func);
     }
 
+    const scannedNames = {};
+
     if (binaryInfo.os === "windows") {
         const imports = await r2.cmdj("iij");
 
@@ -199,9 +201,8 @@ if (args.length > 1 && !gameInfo[args[1]]) {
                 const bytesAfter = 32;
 
                 // The json-printing variants don't seem to work with negative offsets properly,
-                // so seek back 100 bytes and print 128 bytes of instructions (x86 instructions are
-                // self-synchronizing, so this works quite well, increase the window in case of
-                // synchronization problems.)
+                // so seek back in bytes and print forward. x86 instructions are self-synchronizing,
+                // so this works quite well, increase the window in case of synchronization problems.
                 const disassembly = await r2.cmdj("pDj " + (bytesBefore + bytesAfter) + " @ " + (result.offset - bytesBefore));
 
                 // Scan backwards through the disassembly to find the call
@@ -240,7 +241,13 @@ if (args.length > 1 && !gameInfo[args[1]]) {
                     continue;
                 }
 
-                const str = (await r2.cmd("psz @ " + pushes[0].ptr)).trim();
+                const str = "vprof::" + (await r2.cmd("psz @ " + pushes[0].ptr)).trim();
+
+                if (typeof scannedNames[str] === "undefined") {
+                    scannedNames[str] = 1;
+                } else {
+                    scannedNames[str]++;
+                }
 
                 // Scan backwards through the disassembly to find the start of the function (hopefully)
                 // This is a fairly lazy heuristic (depends on prior function alignment leaving dead space or ending in a ret)
@@ -256,16 +263,98 @@ if (args.length > 1 && !gameInfo[args[1]]) {
                     continue;
                 }
 
-                const func = await processFunction(r2, binaryInfo.baddr, disassembly[i].offset, str, result.offset);
+                // ref the function against the first argument push, which is the "start" of the EnterScope call
+                // this is so the vprof result wins over the string search if we're doing both
+                const func = await processFunction(r2, binaryInfo.baddr, disassembly[i].offset, str, pushes[pushes.length - 1].offset);
                 if (!func) {
                     continue;
                 }
 
                 output.push(func);
+            }
 
-                //console.log(disassembly[i]);
+            break;
+        }
 
-                //break;
+        const strings =  await r2.cmdj("izj");
+
+        for (const string of strings) {
+            if (string.type !== "ascii") {
+                continue;
+            }
+
+            let name = Buffer.from(string.string, "base64")
+                .toString("latin1")
+                .match(/(?: in |^(?:Warning: ?|Error: ?)?)([CI][a-zA-Z_]+::~?[a-zA-Z_]+)/);
+
+            if (!name) {
+                continue;
+            }
+
+            name = name[1];
+
+            // If this string exactly matches a vprof name we've already found, skip it to avoid probably duplicate work.
+            if (typeof scannedNames["vprof::" + name] !== "undefined") {
+                continue;
+            }
+
+            name = "string::" + name;
+
+            if (typeof scannedNames[name] === "undefined") {
+                scannedNames[name] = 1;
+            } else {
+                scannedNames[name]++;
+            }
+
+            const search = await r2.cmdj("/cj " + string.vaddr.toString(16));
+
+            for (const result of search) {
+                const opcode = (await r2.cmdj("pdj 1 @ " + result.offset))[0];
+                if (opcode.type !== "push" && opcode.type !== "mov") {
+                    continue;
+                }
+
+                const bytesBefore = 4096;
+                const bytesAfter = 32;
+
+                // The json-printing variants don't seem to work with negative offsets properly,
+                // so seek back in bytes and print forward. x86 instructions are self-synchronizing,
+                // so this works quite well, increase the window in case of synchronization problems.
+                const disassembly = await r2.cmdj("pDj " + (bytesBefore + bytesAfter) + " @ " + (result.offset - bytesBefore));
+
+                // Scan backwards through the disassembly to find the match
+                let i;
+                for (i = disassembly.length - 1; i >= 0; --i) {
+                    if (disassembly[i].opcode === result.code) {
+                        break;
+                    }
+                }
+
+                if (i < 0) {
+                    process.stderr.write("Warning: Failed to find searched instruction in disassembly from " + result.offset + "\n");
+                    continue;
+                }
+
+                // Scan backwards through the disassembly to find the start of the function (hopefully)
+                // This is a fairly lazy heuristic (depends on prior function alignment leaving dead space or ending in a ret)
+                for (--i; i >= 0; --i) {
+                    if (((disassembly[i].opcode === "int3" && disassembly[i + 1].type === "upush") || (disassembly[i].type === "ret" && (disassembly[i + 1].opcode === "push esi" || disassembly[i + 1].opcode === "push ebx")) || disassembly[i + 1].opcode === "push ebp") && (disassembly[i + 1].offset & 0xF) === 0) {
+                        ++i; // Push the cursor back onto the function boundary.
+                        break;
+                    }
+                }
+
+                if (i < 0) {
+                    process.stderr.write("Warning: Failed to find start of function containing " + result.offset + " '" + name + "'\n");
+                    continue;
+                }
+
+                const func = await processFunction(r2, binaryInfo.baddr, disassembly[i].offset, name, result.offset);
+                if (!func) {
+                    continue;
+                }
+
+                output.push(func);
             }
         }
     }
@@ -313,10 +402,17 @@ if (args.length > 1 && !gameInfo[args[1]]) {
     });
 
     const filtered = output.filter((d, i, a) => {
+        /*if (d.name.match(/^vprof::/)) {
+            const distance = d.ref / (d.size + 128); // Offset the size of very small functions.
+            console.log(d.name, distance.toFixed(2));
+        }*/
+
+        if (d.name.match(/^(vprof|string)::/) && scannedNames[d.name] > 1) {
+            d.name = "contains-inlined-" + d.name;
+        }
+
         return i <= 0 || d.offset != a[i - 1].offset;
     });
-
-    // TODO: Scan for vprof names that look like they've been inlined (duplicates)
 
     for (const func of filtered) {
         process.stdout.write([
