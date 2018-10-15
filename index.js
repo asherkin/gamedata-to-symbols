@@ -47,12 +47,22 @@ function printSupportedGames() {
     process.stderr.write("\n");
 }
 
-async function processFunction(r2, baseAddr, offset, name) {
+async function processFunction(r2, baseAddr, offset, name, ref) {
     await r2.cmd("af " + offset + " " + offset);
     const info = (await r2.cmdj("afij " + offset))[0];
 
     if (!info) {
+        process.stderr.write("Warning: Failed to create function from " + offset + " '" + name + "'\n");
         return false;
+    }
+
+    if (!ref) {
+        ref = false;
+    } else if (ref > (info.offset + info.size)) {
+        process.stderr.write("Warning: " + ref + " '" + name + "' outside of created function bounds " + info.offset + " .. " + (info.offset + info.size) + ", probably missed the start\n");
+        return false;
+    } else {
+        ref -= offset;
     }
 
     let paramSize = 0;
@@ -88,17 +98,19 @@ async function processFunction(r2, baseAddr, offset, name) {
         size: info.size,
         paramSize: paramSize,
         name: name,
+        ref: ref,
     };
 }
 
 const args = process.argv.slice(2);
-if (args.length !== 3) {
-    process.stderr.write("Usage: <binary path> <game> <gamedata path>\n");
+if (args.length !== 1 && args.length !== 4) {
+    process.stderr.write("Usage: <binary path> [<game> <binary type> <gamedata path>]\n");
     printSupportedGames();
+    process.stderr.write("Binary types: engine server matchmaking_ds etc.\n");
     process.exit(1);
 }
 
-if (!gameInfo[args[1]]) {
+if (args.length > 1 && !gameInfo[args[1]]) {
     process.stderr.write("Error: " + args[1] + " is not a supported game\n");
     printSupportedGames();
     process.exit(1);
@@ -108,36 +120,38 @@ if (!gameInfo[args[1]]) {
     const r2 = await r2promise.open(args[0]);
     const binaryInfo = await r2.cmdj("iIj");
 
-    let platform = binaryInfo.os;
-    if (binaryInfo.bits !== 32) {
-        platform += binaryInfo.bits;
-    }
-
-    const gamedataParser = require("./gamedata-parser")(platform, gameInfo[args[1]]);
-    const gamedata = await gamedataParser.loadAll(args[2]);
-
     const output = [];
 
-    for (const file of gamedata) {
-        for (const key in file.signatures) {
-            const name = file.name + "::" + key;
-            const signature = translateSignature(file.signatures[key]);
+    if (args.length >= 4) {
+        let platform = binaryInfo.os;
+        if (binaryInfo.bits !== 32) {
+            platform += binaryInfo.bits;
+        }
 
-            const search = await r2.cmdj("/xj " + signature);
-            if (search.length === 0) {
-                process.stderr.write("Warning: Failed to find match for " + name + "\n");
-                continue;
-            } else if (search.length > 1) {
-                process.stderr.write("Warning: Multiple matches found for " + name + "\n");
+        const gamedataParser = require("./gamedata-parser")(platform, gameInfo[args[1]], args[2]);
+        const gamedata = await gamedataParser.loadAll(args[3]);
+
+        for (const file of gamedata) {
+            for (const key in file.signatures) {
+                const name = file.name + "::" + key;
+                const signature = translateSignature(file.signatures[key]);
+
+                const search = await r2.cmdj("/xj " + signature);
+                if (search.length === 0) {
+                    process.stderr.write("Warning: Failed to find match for " + name + "\n");
+                    continue;
+                } else if (search.length > 1) {
+                    process.stderr.write("Warning: Multiple matches found for " + name + "\n");
+                }
+
+                const result = search[0];
+                const func = await processFunction(r2, binaryInfo.baddr, result.offset, name, result.offset + 1); // Add a bit extra to the "ref" used for sorting, so exports are preferred.
+                if (!func) {
+                    continue;
+                }
+
+                output.push(func);
             }
-
-            const result = search[0];
-            const func = await processFunction(r2, binaryInfo.baddr, result.offset, name);
-            if (!func) {
-                continue;
-            }
-
-            output.push(func);
         }
     }
 
@@ -158,12 +172,102 @@ if (!gameInfo[args[1]]) {
             }
         }
 
-        const func = await processFunction(r2, binaryInfo.baddr, exprt.vaddr, name);
+        const func = await processFunction(r2, binaryInfo.baddr, exprt.vaddr, name, exprt.vaddr);
         if (!func) {
             continue;
         }
 
         output.push(func);
+    }
+
+    if (binaryInfo.os === "windows") {
+        const imports = await r2.cmdj("iij");
+
+        for (const imprt of imports) {
+            if (imprt.type !== "FUNC") {
+                continue;
+            }
+
+            if (!imprt.name.match(/\.dll_\?EnterScope@CVProfile@@/)) {
+                continue;
+            }
+
+            const search = await r2.cmdj("/cj call dword [0x" + imprt.plt.toString(16) + "]");
+
+            for (const result of search) {
+                const bytesBefore = 4096;
+                const bytesAfter = 32;
+
+                // The json-printing variants don't seem to work with negative offsets properly,
+                // so seek back 100 bytes and print 128 bytes of instructions (x86 instructions are
+                // self-synchronizing, so this works quite well, increase the window in case of
+                // synchronization problems.)
+                const disassembly = await r2.cmdj("pDj " + (bytesBefore + bytesAfter) + " @ " + (result.offset - bytesBefore));
+
+                // Scan backwards through the disassembly to find the call
+                let i;
+                for (i = disassembly.length - 1; i >= 0; --i) {
+                    if (disassembly[i].opcode === result.code) {
+                        break;
+                    }
+                }
+
+                if (i < 0) {
+                    process.stderr.write("Warning: Failed to find call instruction in disassembly from " + result.offset + "\n");
+                    continue;
+                }
+
+                // Scan backwards through the disassembly to find the 5 EnterScope arguments
+                const pushes = [];
+                for (--i; i >= 0; --i) {
+                    if (disassembly[i].type === "push" || disassembly[i].type === "upush") {
+                        pushes.push(disassembly[i]);
+                    }
+                    if (pushes.length >= 5) {
+                        break;
+                    }
+                }
+
+                if (i < 0) {
+                    process.stderr.write("Warning: Failed to find 5 push instructions in disassembly from " + result.offset + "\n");
+                    continue;
+                }
+
+                // Last arg is the string we want, only want absolute data refs.
+                if (pushes[0].type !== "push") {
+                    // console.log("0x" + result.offset.toString(16), pushes[0]);
+                    process.stderr.write("Warning: EnterScope call at " + result.offset + " does not push an absolute string ref\n");
+                    continue;
+                }
+
+                const str = (await r2.cmd("psz @ " + pushes[0].ptr)).trim();
+
+                // Scan backwards through the disassembly to find the start of the function (hopefully)
+                // This is a fairly lazy heuristic (depends on prior function alignment leaving dead space or ending in a ret)
+                for (--i; i >= 0; --i) {
+                    if (((disassembly[i].opcode === "int3" && disassembly[i + 1].type === "upush") || (disassembly[i].type === "ret" && (disassembly[i + 1].opcode === "push esi" || disassembly[i + 1].opcode === "push ebx")) || disassembly[i + 1].opcode === "push ebp") && (disassembly[i + 1].offset & 0xF) === 0) {
+                        ++i; // Push the cursor back onto the function boundary.
+                        break;
+                    }
+                }
+
+                if (i < 0) {
+                    process.stderr.write("Warning: Failed to find start of function containing " + result.offset + " '" + str + "'\n");
+                    continue;
+                }
+
+                const func = await processFunction(r2, binaryInfo.baddr, disassembly[i].offset, str, result.offset);
+                if (!func) {
+                    continue;
+                }
+
+                output.push(func);
+
+                //console.log(disassembly[i]);
+
+                //break;
+            }
+        }
     }
 
     r2.quit();
@@ -198,15 +302,30 @@ if (!gameInfo[args[1]]) {
         "\n",
     ].join(" "));
 
-    output.sort((a, b) => a.offset - b.offset);
+    output.sort((a, b) => {
+        if (a.offset < b.offset) {
+            return -1;
+        } else if (a.offset > b.offset) {
+            return 1;
+        } else {
+            return a.ref - b.ref;
+        }
+    });
 
-    for (const func of output) {
+    const filtered = output.filter((d, i, a) => {
+        return i <= 0 || d.offset != a[i - 1].offset;
+    });
+
+    // TODO: Scan for vprof names that look like they've been inlined (duplicates)
+
+    for (const func of filtered) {
         process.stdout.write([
             "FUNC",
             func.offset.toString(16),
             func.size.toString(16),
             func.paramSize.toString(16),
             func.name,
+            // func.ref,
             "\n",
         ].join(" "));
     }

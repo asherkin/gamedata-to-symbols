@@ -17,7 +17,7 @@ async function readSmcFile(file) {
     }
 }
 
-module.exports = function(requiredPlatform, requiredGame) {
+module.exports = function(requiredPlatform, requiredGame, requiredLibrary) {
     let requiredEngine = null;
     let requiredEngines = (requiredGame.engine instanceof Array) ? requiredGame.engine : [ requiredGame.engine ];
     let requiredGameDirectory = requiredGame.directory && requiredGame.directory.toLowerCase();
@@ -107,6 +107,16 @@ module.exports = function(requiredPlatform, requiredGame) {
                         case "Signatures":
                             for (const signature of section.value) {
                                 for (const platform of signature.value) {
+                                    if (platform.key === "library") {
+                                        if (platform !== signature.value[0]) {
+                                            throw new Error("Expected 'library' section to be first child of signature block '" + signature.key + "' in " + file);
+                                        }
+
+                                        if (platform.value !== requiredLibrary) {
+                                            break;
+                                        }
+                                    }
+
                                     if (platform.key === requiredPlatform) {
                                         output.signatures[signature.key] = platform.value;
                                     }
