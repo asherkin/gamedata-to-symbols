@@ -23,13 +23,6 @@ function translateSignature(signature) {
         .join("");
 }
 
-async function getDllDebugIdentifier(file) {
-    // TODO: Make this safe.
-    const cmd = await childProcessExec("objdump -p " + file + " | grep -A1 CodeView | tail -n 1");
-    const debugInfo = cmd.stdout.trim().match(/^\(format [^ ]+ signature ([^ ]+) age ([^ ]+)\)$/);
-    return debugInfo[1].toUpperCase() + (+debugInfo[2]).toString(16).toLowerCase();
-}
-
 async function getSoDebugIdentifier(file) {
     // TODO: Make this safe.
     const cmd = await childProcessExec("objdump -s -j .note.gnu.build-id " + file + " | grep -A2 'Contents of section' | tail -n 1");
@@ -70,7 +63,7 @@ async function processFunction(r2, baseAddr, offset, name, ref) {
         if (bpvar.kind !== "arg") {
             continue;
         }
-        if (bpvar.type !== "int") {
+        if (bpvar.type !== "int32_t") {
             throw new Error("unknown bpvar arg type " + bpvar.type);
         }
         paramSize += 4;
@@ -79,7 +72,7 @@ async function processFunction(r2, baseAddr, offset, name, ref) {
         if (spvar.kind !== "arg") {
             continue;
         }
-        if (spvar.type !== "int") {
+        if (spvar.type !== "int32_t") {
             throw new Error("unknown spvar arg type " + spvar.type);
         }
         paramSize += 4;
@@ -117,7 +110,7 @@ if (args.length > 1 && !gameInfo[args[1]]) {
 }
 
 (async function() {
-    const r2 = await r2promise.open(args[0]);
+    const r2 = await r2promise.open(args[0], ["-M", "-e asm.assembler=x86.as"]);
     const binaryInfo = await r2.cmdj("iIj");
 
     const output = [];
@@ -164,7 +157,6 @@ if (args.length > 1 && !gameInfo[args[1]]) {
 
         let name = exprt.name;
         if (binaryInfo.bintype === "pe") {
-            name = name.match(/_(.*)$/)[1];
             let demangledName = (await r2.cmd("\"iD msvc " + name + "\"")).trim();
             demangledName = demangledName.match(/^[^:]+: [^ ]+ [^ ]+ (.+)$/);
             if (demangledName) {
@@ -190,11 +182,11 @@ if (args.length > 1 && !gameInfo[args[1]]) {
                 continue;
             }
 
-            if (!imprt.name.match(/\.dll_\?EnterScope@CVProfile@@/)) {
+            if (!imprt.name.match(/\?EnterScope@CVProfile@@/)) {
                 continue;
             }
 
-            const search = await r2.cmdj("/cj call dword [0x" + imprt.plt.toString(16) + "]");
+            const search = await r2.cmdj("/adj call [0x" + imprt.plt.toString(16) + "]");
 
             for (const result of search) {
                 const bytesBefore = 4096;
@@ -276,16 +268,14 @@ if (args.length > 1 && !gameInfo[args[1]]) {
             break;
         }
 
-        const strings =  await r2.cmdj("izj");
+        const strings = await r2.cmdj("izj");
 
         for (const string of strings) {
             if (string.type !== "ascii") {
                 continue;
             }
 
-            let name = Buffer.from(string.string, "base64")
-                .toString("latin1")
-                .match(/(?: in |^(?:Warning: ?|Error: ?)?)([CI][a-zA-Z_]+::~?[a-zA-Z_]+)/);
+            let name = string.string.match(/(?: in |^(?:Warning: ?|Error: ?)?)([CI][a-zA-Z_]+::~?[a-zA-Z_]+)/);
 
             if (!name) {
                 continue;
@@ -306,7 +296,7 @@ if (args.length > 1 && !gameInfo[args[1]]) {
                 scannedNames[name]++;
             }
 
-            const search = await r2.cmdj("/cj " + string.vaddr.toString(16));
+            const search = await r2.cmdj("/adj " + string.vaddr.toString(16));
 
             for (const result of search) {
                 const opcode = (await r2.cmdj("pdj 1 @ " + result.offset))[0];
@@ -371,8 +361,7 @@ if (args.length > 1 && !gameInfo[args[1]]) {
         headerDebugIdentifier = await getSoDebugIdentifier(args[0]);
     } else if (binaryInfo.os === "windows") {
         headerPlatform = "windows";
-        // headerDebugIdentifier = binaryInfo.guid; // https://github.com/radare/radare2/pull/11805
-        headerDebugIdentifier = await getDllDebugIdentifier(args[0]);
+        headerDebugIdentifier = binaryInfo.guid;
         headerDebugName = path.basename(binaryInfo.dbg_file);
     }
 
