@@ -23,15 +23,6 @@ function translateSignature(signature) {
         .join("");
 }
 
-async function getSoDebugIdentifier(file) {
-    // TODO: Make this safe.
-    const cmd = await childProcessExec("objdump -s -j .note.gnu.build-id " + file + " | grep -A2 'Contents of section' | tail -n 1");
-    const debugInfo = cmd.stdout.trim().match(/^[0-9a-f]+ +([0-9a-f]{8}) ([0-9a-f]{8}) ([0-9a-f]{8}) ([0-9a-f]{8}) /);
-    debugInfo[1] = debugInfo[1].match(/../g).reverse().join("");
-    debugInfo[2] = debugInfo[2].match(/..../g).map((c) => c.match(/../g).reverse().join("")).join("");
-    return (debugInfo[1] + debugInfo[2] + debugInfo[3] + debugInfo[4] + "0").toUpperCase();
-}
-
 function printSupportedGames() {
     process.stderr.write("Supported games:");
     for (const game of Object.keys(gameInfo)) {
@@ -349,8 +340,6 @@ if (args.length > 1 && !gameInfo[args[1]]) {
         }
     }
 
-    r2.quit();
-
     let headerPlatform = "unknown";
     let headerArch = "unknown";
     let headerDebugIdentifier = null;
@@ -358,7 +347,14 @@ if (args.length > 1 && !gameInfo[args[1]]) {
 
     if (binaryInfo.os === "linux") {
         headerPlatform = "Linux";
-        headerDebugIdentifier = await getSoDebugIdentifier(args[0]);
+
+        const sections = await r2.cmdj("iSj");
+        const buildIdSection = sections.find(section => section.name === ".note.gnu.build_id");
+        const buildIdRaw = await r2.cmdj("pxj " + buildIdSection.size + " @ 0x" + buildIdSection.paddr.toString(16));
+        const buildIdBytes = buildIdRaw.slice(16, 32).map((b) => ("0" + b.toString(16)).slice(-2).toUpperCase());
+        const buildId = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15].map(i => buildIdBytes[i]).join("") + "0";
+
+        headerDebugIdentifier = buildId;
     } else if (binaryInfo.os === "windows") {
         headerPlatform = "windows";
         headerDebugIdentifier = binaryInfo.guid;
@@ -370,6 +366,8 @@ if (args.length > 1 && !gameInfo[args[1]]) {
     } else if (binaryInfo.arch === "x86" && binaryInfo.bits === 64) {
         headerArch = "x86_64";
     }
+
+    r2.quit();
 
     process.stdout.write([
         "MODULE",
