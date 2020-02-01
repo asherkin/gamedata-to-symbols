@@ -110,7 +110,7 @@ if (args.length > 1 && !gameInfo[args[1]]) {
 }
 
 (async function() {
-    const r2 = await r2promise.open(args[0], ["-M", "-e asm.assembler=x86.as"]);
+    const r2 = await r2promise.open(args[0], ["-M"]);
     const binaryInfo = await r2.cmdj("iIj");
 
     const output = [];
@@ -186,7 +186,7 @@ if (args.length > 1 && !gameInfo[args[1]]) {
                 continue;
             }
 
-            const search = await r2.cmdj("/adj call [0x" + imprt.plt.toString(16) + "]");
+            const search = await r2.cmdj("/adj call dword [0x" + imprt.plt.toString(16) + "]");
 
             for (const result of search) {
                 const bytesBefore = 4096;
@@ -213,7 +213,7 @@ if (args.length > 1 && !gameInfo[args[1]]) {
                 // Scan backwards through the disassembly to find the 5 EnterScope arguments
                 const pushes = [];
                 for (--i; i >= 0; --i) {
-                    if (disassembly[i].type === "push" || disassembly[i].type === "upush") {
+                    if (disassembly[i].type === "push" || disassembly[i].type === "upush" || disassembly[i].type === "rpush") {
                         pushes.push(disassembly[i]);
                     }
                     if (pushes.length >= 5) {
@@ -244,7 +244,7 @@ if (args.length > 1 && !gameInfo[args[1]]) {
                 // Scan backwards through the disassembly to find the start of the function (hopefully)
                 // This is a fairly lazy heuristic (depends on prior function alignment leaving dead space or ending in a ret)
                 for (--i; i >= 0; --i) {
-                    if (((disassembly[i].opcode === "int3" && disassembly[i + 1].type === "upush") || (disassembly[i].type === "ret" && (disassembly[i + 1].opcode === "push esi" || disassembly[i + 1].opcode === "push ebx")) || disassembly[i + 1].opcode === "push ebp") && (disassembly[i + 1].offset & 0xF) === 0) {
+                    if (((disassembly[i].opcode === "int3" && (disassembly[i + 1].type === "upush" || disassembly[i + 1].type === "rpush")) || (disassembly[i].type === "ret" && (disassembly[i + 1].opcode === "push esi" || disassembly[i + 1].opcode === "push ebx")) || disassembly[i + 1].opcode === "push ebp") && (disassembly[i + 1].offset & 0xF) === 0) {
                         ++i; // Push the cursor back onto the function boundary.
                         break;
                     }
@@ -328,7 +328,7 @@ if (args.length > 1 && !gameInfo[args[1]]) {
                 // Scan backwards through the disassembly to find the start of the function (hopefully)
                 // This is a fairly lazy heuristic (depends on prior function alignment leaving dead space or ending in a ret)
                 for (--i; i >= 0; --i) {
-                    if (((disassembly[i].opcode === "int3" && disassembly[i + 1].type === "upush") || (disassembly[i].type === "ret" && (disassembly[i + 1].opcode === "push esi" || disassembly[i + 1].opcode === "push ebx")) || disassembly[i + 1].opcode === "push ebp") && (disassembly[i + 1].offset & 0xF) === 0) {
+                    if (((disassembly[i].opcode === "int3" && (disassembly[i + 1].type === "upush" || disassembly[i + 1].type === "rpush")) || (disassembly[i].type === "ret" && (disassembly[i + 1].opcode === "push esi" || disassembly[i + 1].opcode === "push ebx")) || disassembly[i + 1].opcode === "push ebp") && (disassembly[i + 1].offset & 0xF) === 0) {
                         ++i; // Push the cursor back onto the function boundary.
                         break;
                     }
